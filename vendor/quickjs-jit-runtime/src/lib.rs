@@ -706,6 +706,15 @@ unsafe impl rquickjs_core::runtime::JitBackend for NoopBackend {}
 #[cfg(all(feature = "compiler", not(target_family = "wasm")))]
 const HOT_MAINTENANCE_INTERVAL: u32 = 64;
 
+/// HERDR: the shortest time between two full maintenance passes started from
+/// the per-call path. Feedback changes on nearly every call while scripts
+/// warm up, and a full pass copies the global feedback table once per Tier-2
+/// candidate, so with many scripts in one runtime back-to-back passes kept
+/// the embedder's main thread busy for seconds at a time. Installing,
+/// demoting and reclaiming a little later only delays tier changes.
+#[cfg(all(feature = "compiler", not(target_family = "wasm")))]
+const MAINTENANCE_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Inputs of a deferred Tier-2 candidate decision: feedback lattices, the
 /// installed-artifact count (callee resolution and direct-call readiness), and
 /// whether the element-loop gate has its eight baseline samples.
@@ -835,6 +844,8 @@ struct ProductionBackend {
     /// worker completions, new feedback, or a bounded number of skipped
     /// ticks. The clock still advances on every tick.
     hot_ticks_since_maintenance: u32,
+    /// When the last full maintenance pass started (see [`MAINTENANCE_MIN_GAP`]).
+    last_maintenance_at: Option<std::time::Instant>,
     generic_call_rejections: u64,
     last_scan_feedback_version: u64,
     last_scan_installed: u64,
@@ -2498,6 +2509,7 @@ impl ProductionBackend {
             osr_validation: Arc::new(OsrValidationMetrics::default()),
             clock: 0,
             hot_ticks_since_maintenance: 0,
+            last_maintenance_at: None,
             generic_call_rejections: 0,
             last_scan_feedback_version: u64::MAX,
             last_scan_installed: u64::MAX,
@@ -2571,7 +2583,7 @@ impl ProductionBackend {
             || self.feedback.version() != self.last_scan_feedback_version
             || self.coordinator.installed_count() != self.last_scan_installed
             || self.clock >= self.next_profitability_retry;
-        if due {
+        if due && self.maintenance_gap_elapsed() {
             self.maintenance();
             // Only future retries can make the next maintenance due; one the
             // scan did not reach waits for ordinary maintenance.
@@ -2714,9 +2726,20 @@ impl ProductionBackend {
         self.coordinator.demote_baseline_to_interpreter(key);
     }
 
+    /// Whether the per-call path may start a full pass now. Tests keep the
+    /// exact per-call behaviour they assert on.
+    fn maintenance_gap_elapsed(&self) -> bool {
+        if cfg!(any(test, feature = "test-support")) {
+            return true;
+        }
+        self.last_maintenance_at
+            .is_none_or(|at| at.elapsed() >= MAINTENANCE_MIN_GAP)
+    }
+
     fn maintenance(&mut self) {
         // Maintenance owns installation, demotion, feedback-epoch updates,
         // and reclamation. Invalidate before touching any of those states.
+        self.last_maintenance_at = Some(std::time::Instant::now());
         self.invalidate_entry_cache();
         self.hot_ticks_since_maintenance = 0;
         self.last_scan_feedback_version = self.feedback.version();
